@@ -1,0 +1,14 @@
+src/**/*.java:
+  - java
+
+.github/workflows/**:
+  - ci/cd
+
+pom.xml:
+  - dependencies
+
+'**/*.md':
+  - documentation
+
+src/test/**:
+  - tests
