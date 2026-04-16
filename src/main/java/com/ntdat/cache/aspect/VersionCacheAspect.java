@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.ntdat.cache.annotation.BumpVersion;
 import com.ntdat.cache.annotation.VersionCache;
 import com.ntdat.cache.cache.VersionLocalCache;
+import com.ntdat.cache.config.RedisPubSubConfiguration;
 import com.ntdat.cache.config.VersionCacheProperties;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -17,7 +18,9 @@ import org.springframework.expression.*;
 import org.springframework.expression.spel.standard.SpelExpressionParser;
 import org.springframework.stereotype.Component;
 
+import java.util.Map;
 import java.util.StringJoiner;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 @Slf4j
@@ -34,6 +37,8 @@ public class VersionCacheAspect {
     private final ExpressionParser parser = new SpelExpressionParser();
     private final ParameterNameDiscoverer nameDiscoverer = new DefaultParameterNameDiscoverer();
 
+    private final Map<String, Object> keyLocks = new ConcurrentHashMap<>();
+
     // ================= READ =================
     @Around("@annotation(autoCache)")
     public Object handleRead(ProceedingJoinPoint joinPoint, VersionCache autoCache) throws Throwable {
@@ -44,26 +49,11 @@ public class VersionCacheAspect {
 
         Object userId = parseSpel(joinPoint, autoCache.userId());
         String entity = autoCache.entity();
-
         String vKey = buildVersionKey(entity, userId);
 
         try {
             // 🔥 1. local cache
-            String version = localCache.get(vKey);
-
-            if (version != null) {
-                logHit("LOCAL_VERSION_HIT", vKey);
-            } else {
-                // 🔥 2. Redis
-                version = redisTemplate.opsForValue().get(vKey);
-
-                if (version == null) {
-                    version = "0";
-                }
-
-                localCache.put(vKey, version);
-                logHit("REDIS_VERSION_HIT", vKey);
-            }
+            String version = getVersion(vKey);
 
             String extraKey = buildExtraKey(joinPoint, autoCache.extraKeys());
             String finalKey = buildDataKey(entity, userId, extraKey, version);
@@ -73,26 +63,39 @@ public class VersionCacheAspect {
 
             if (cached != null) {
                 logHit("DATA_CACHE_HIT", finalKey);
-
-                MethodSignature sig = (MethodSignature) joinPoint.getSignature();
-                return objectMapper.readValue(cached, sig.getReturnType());
+                return deserialize(cached, joinPoint);
             }
 
+            // 4. Single Flight if Cache Miss
             logMiss(finalKey);
 
-            // 🔥 4. miss
-            Object result = joinPoint.proceed();
+            Object lock = keyLocks.computeIfAbsent(finalKey, k -> new Object());
 
-            if (result != null) {
-                redisTemplate.opsForValue().set(
-                        finalKey,
-                        objectMapper.writeValueAsString(result),
-                        autoCache.ttl(),
-                        autoCache.unit()
-                );
+            synchronized (lock) {
+                try {
+                    String retryCache = redisTemplate.opsForValue().get(finalKey);
+                    if (retryCache != null) {
+                        logHit("SINGLE_FLIGHT_RECOVERY", finalKey);
+                        return deserialize(retryCache, joinPoint);
+                    }
+
+                    log.info("[SINGLE_FLIGHT] Only one thread fetching DB for: {}", finalKey);
+
+                    Object result = joinPoint.proceed();
+
+                    if (result != null) {
+                        redisTemplate.opsForValue().set(
+                                finalKey,
+                                objectMapper.writeValueAsString(result),
+                                autoCache.ttl(),
+                                autoCache.unit()
+                        );
+                    }
+                    return result;
+                } finally {
+                    keyLocks.remove(finalKey);
+                }
             }
-
-            return result;
 
         } catch (Exception ex) {
             // 🔥 fallback
@@ -109,17 +112,13 @@ public class VersionCacheAspect {
 
         Object userId = parseSpel(joinPoint, bump.userId());
         String entity = bump.entity();
-
         String vKey = buildVersionKey(entity, userId);
 
         try {
             Long newVersion = redisTemplate.opsForValue().increment(vKey);
-
             redisTemplate.expire(vKey, props.getVersionKeyTtlDays(), TimeUnit.DAYS);
 
-            if (newVersion != null) {
-                localCache.put(vKey, String.valueOf(newVersion));
-            }
+            redisTemplate.convertAndSend(RedisPubSubConfiguration.VERSION_INVALIDATE_CHANNEL, vKey);
 
             log.info("[CACHE_BUMP] key={}, version={}", vKey, newVersion);
 
@@ -147,6 +146,26 @@ public class VersionCacheAspect {
     }
 
     // ================= HELPER =================
+
+    private String getVersion(String vKey) {
+        String version = localCache.get(vKey);
+        if (version != null) {
+            logHit("LOCAL_VERSION_HIT", vKey);
+            return version;
+        }
+
+        version = redisTemplate.opsForValue().get(vKey);
+        if (version == null) version = "0";
+
+        localCache.put(vKey, version);
+        logHit("REDIS_VERSION_HIT", vKey);
+        return version;
+    }
+
+    private Object deserialize(String value, JoinPoint joinPoint) throws Exception {
+        MethodSignature signature = (MethodSignature) joinPoint.getSignature();
+        return objectMapper.readValue(value, signature.getReturnType());
+    }
 
     private String buildVersionKey(String entity, Object userId) {
         return "version:" + entity + ":" + userId;
